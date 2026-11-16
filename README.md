@@ -118,6 +118,7 @@ runs waited in the queue.
 | `tg-log mark [note]` | mark the moment when the Mac froze |
 | `tg-log summary [days]` | results from the logs |
 | `tg-measure <cmd>` | measure one run |
+| `tg-classify "<cmd>"` | show how the hook sees a command, and which rule decided it |
 
 Data is in `~/Library/Application Support/test-gate/`, logs are in `logs/`
 inside it.
@@ -135,13 +136,42 @@ inside it.
 - **Blocked:** watch mode (`--watch`, `--watchAll`, scripts like `test:watch`),
   and `tg-run --light` for a heavy run.
 
-When the hook is not sure, it treats the command as heavy. You can add your
-own rules (regex, added to the defaults):
+When the hook is not sure, it treats the command as heavy.
 
-- `TEST_GATE_HEAVY_SCRIPTS_EXTRA`: more script names that run tests, for
-  example `'^build$'`.
-- `TEST_GATE_ALWAYS_HEAVY_EXTRA`: more words that make a run heavy even with
-  test files.
+### Your own rules
+
+If the hook is wrong for your project, write your own rules in
+`~/.config/test-gate/rules` (or in the file set by `TEST_GATE_RULES`).
+One rule per line:
+
+```
+# heavy <regex>: always use the queue
+# light <regex>: never use the queue
+heavy ^yarn verify$
+light ^yarn test:unit
+```
+
+- The regex is checked against one simple command (the part between `&&`,
+  `;`, `|`). Before the check, env vars (`CI=1`), wrappers (`time`,
+  `timeout 60`, `sudo`) and extra spaces are removed, and quoted text is
+  replaced by `""`. So `CI=1 time yarn verify` is checked as `yarn verify`.
+- Use `^` and `$`: `light test:unit` also matches `test:unit:all`.
+- Your rules are checked first. The first rule that matches wins.
+- Rules cannot allow watch mode or `tg-run --light` for a heavy run.
+- Changes work at once, in all sessions.
+
+Check how a command is seen:
+
+```bash
+tg-classify "yarn --cwd api test:it __tests__/db.test.ts"
+```
+
+```
+kind:  heavy
+part:  yarn --cwd api test:it __tests__/db.test.ts
+rule:  built-in
+means: blocked unless it runs as: tg-run -- <command>
+```
 
 To turn the hook off for a while: `TEST_GATE_HOOK=off`.
 

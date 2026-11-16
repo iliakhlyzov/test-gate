@@ -2,6 +2,8 @@
 # Table tests for lib/classify.sh. Run: tests/classify.test.sh
 cd "$(dirname "$0")/.." || exit 1
 . lib/classify.sh
+# Built-in rules only: do not read the rules file of the person who runs the tests.
+export TEST_GATE_RULES=/nonexistent
 
 fail=0
 check() { # expected kind, command
@@ -93,5 +95,54 @@ check none 'yarn lint'
 check none 'yarn build'
 check none 'ls -la'
 check none 'echo done; ls'
+
+# User rules file.
+rules=$(mktemp)
+trap 'rm -f "$rules"' EXIT
+cat >"$rules" <<'RULES'
+# my rules
+light test:unit
+
+heavy ^yarn verify
+heavy (^| )lint:types
+light test:ci .*/smoke/
+nonsense line is ignored
+RULES
+export TEST_GATE_RULES=$rules
+check light 'yarn test:unit'
+check light 'cd api && yarn test:unit'
+check heavy 'yarn verify'
+check heavy 'yarn lint:types'
+check light 'yarn test:ci src/smoke/'
+check heavy 'yarn test:ci'
+check watch 'yarn test:unit --watch'
+check gated 'tg-run --light -- yarn test:unit'
+check misuse 'tg-run --light -- yarn test'
+check gated 'tg-run -- yarn verify'
+check none 'git commit -m "yarn verify"'
+
+check heavy 'CI=1 yarn verify'
+check heavy 'time yarn  verify'
+check heavy 'FOO="a b" timeout 60 yarn verify'
+check light 'yarn exec test:unit'
+
+# Windows line ends and no newline at the end of the file.
+printf 'heavy ^yarn verify$\r\nlight ^jest$\r\nheavy ^yarn lint:all$' >"$rules"
+check heavy 'yarn verify'
+check light 'npx jest'
+check heavy 'yarn lint:all'
+out=$(bin/tg-classify "npx jest")
+case "$out" in *"kind:  light"*"rule:  light ^jest\$"*) echo "ok    tg-classify shows a rule that decided an inner command" ;; *) echo "FAIL  tg-classify inner: $out"; fail=1 ;; esac
+printf 'light .*\n' >"$rules"
+out=$(bin/tg-classify "yarn watch:css")
+case "$out" in *"kind:  light"*) echo "ok    light .* changes none to light" ;; *) echo "FAIL  light .*: $out"; fail=1 ;; esac
+out=$(bin/tg-classify "yarn test --watch")
+case "$out" in *"kind:  watch"*"rule:  built-in"*) echo "ok    rules never change watch" ;; *) echo "FAIL  watch with rule: $out"; fail=1 ;; esac
+printf 'heavy ^yarn verify\n' >"$rules"
+
+out=$(bin/tg-classify "yarn verify")
+case "$out" in *"rule:  heavy ^yarn verify"*) echo "ok    tg-classify shows the user rule" ;; *) echo "FAIL  tg-classify: $out"; fail=1 ;; esac
+out=$(bin/tg-classify "yarn test")
+case "$out" in *"rule:  built-in"*"means: blocked unless"*) echo "ok    tg-classify shows built-in rule" ;; *) echo "FAIL  tg-classify: $out"; fail=1 ;; esac
 
 exit $fail

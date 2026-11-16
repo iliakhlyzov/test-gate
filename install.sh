@@ -13,7 +13,7 @@ ROOT=$(cd "$(dirname "$0")" && pwd)
 PREFIX=${PREFIX:-$HOME/.local/bin}
 SETTINGS="$HOME/.claude/settings.json"
 HOOK="$PREFIX/tg-claude-hook"
-CMDS="tg-run tg-status tg-log tg-measure tg-claude-hook"
+CMDS="tg-run tg-status tg-log tg-measure tg-classify tg-claude-hook"
 
 want_hook=0
 uninstall=0

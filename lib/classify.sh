@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Decides how heavy a shell command is for the machine.
 #
-#   tg_classify "<command line>"  ->  prints "<kind><TAB><part of the command>"
+#   tg_classify "<command line>"  ->  prints "<kind><TAB><part><TAB><user rule or empty>"
 #
 # kind (the most serious one wins when the command has several parts):
 #   watch   - a test runner in watch mode (it never ends)
@@ -11,9 +11,13 @@
 #   gated   - already wrapped in tg-run
 #   none    - nothing about tests
 #
-# This is a heuristic. Extend it with (regex, added to the defaults):
-#   TEST_GATE_HEAVY_SCRIPTS_EXTRA   more package.json script names that run tests, e.g. '^build$'
-#   TEST_GATE_ALWAYS_HEAVY_EXTRA    more words that make a run heavy even with test files
+# This is a heuristic. You can change the result with your own rules in
+# ~/.config/test-gate/rules (or the file in TEST_GATE_RULES), one per line:
+#   heavy <regex>    matching commands go through the queue
+#   light <regex>    matching commands run without the queue
+# The regex is checked against one simple command, after env vars (CI=1)
+# and wrappers (time, timeout, sudo) are removed. The first matching rule
+# wins. Rules cannot change watch, misuse or gated.
 
 TG_RUNNERS='^(jest|vitest|mocha|ava|playwright|cypress)$'
 TG_HEAVY_SCRIPTS='^(test|tests|e2e|integration|ci|(test|e2e|integration)[:-].*)$'
@@ -26,19 +30,34 @@ tg_kind_rank() {
   case "$1" in watch) echo 5 ;; misuse) echo 4 ;; heavy) echo 3 ;; light) echo 2 ;; gated) echo 1 ;; *) echo 0 ;; esac
 }
 
-# Classify one simple command (no ; && || | in it).
-tg_classify_segment() {
-  local seg=$1 w1 name="" sub a has_file=0 watch=0 light_flag=0 inner rest=""
-  local heavy_scripts=$TG_HEAVY_SCRIPTS always_heavy=$TG_ALWAYS_HEAVY
-  [ -n "${TEST_GATE_HEAVY_SCRIPTS_EXTRA:-}" ] && heavy_scripts="$heavy_scripts|$TEST_GATE_HEAVY_SCRIPTS_EXTRA"
-  [ -n "${TEST_GATE_ALWAYS_HEAVY_EXTRA:-}" ] && always_heavy="$always_heavy|$TEST_GATE_ALWAYS_HEAVY_EXTRA"
+tg_rules_file() { printf '%s\n' "${TEST_GATE_RULES:-${XDG_CONFIG_HOME:-$HOME/.config}/test-gate/rules}"; }
 
+# Prints "<kind> <regex>" of the first user rule that matches $1, or nothing.
+# A bad regex does not match. Windows line ends and a missing last newline are fine.
+tg_user_rule() {
+  local f kind re
+  f=$(tg_rules_file)
+  [ -f "$f" ] || return 0
+  while read -r kind re || [ -n "$kind" ]; do
+    kind=${kind%$'\r'}
+    re=${re%$'\r'}
+    case "$kind" in heavy | light) ;; *) continue ;; esac # comments, empty lines
+    [ -n "$re" ] || continue
+    if [[ "$1" =~ $re ]]; then
+      printf '%s %s\n' "$kind" "$re"
+      return 0
+    fi
+  done <"$f"
+}
+
+# Removes env assignments, shell keywords and wrappers (time, timeout,
+# sudo, ...) from the start of a simple command, and repeated spaces.
+# "CI=1 time yarn  verify" -> "yarn verify"
+tg_normalize() {
   set -f
   # shellcheck disable=SC2086
-  set -- $seg
+  set -- $1
   set +f
-
-  # Skip env assignments, shell keywords and wrapper commands.
   while [ $# -gt 0 ]; do
     case "$1" in
       env | time | command | exec | nohup | if | then | else | elif | do | while | until | '{' | '!') shift ;;
@@ -54,6 +73,33 @@ tg_classify_segment() {
       *) break ;;
     esac
   done
+  printf '%s\n' "$*"
+}
+
+# Classify one simple command (no ; && || | in it): built-in rules, then
+# user rules. User rules change only heavy, light and none.
+# Prints "<kind>", or "<kind>|<rule>" when a user rule decided.
+tg_classify_segment() {
+  local norm kind rule
+  norm=$(tg_normalize "$1")
+  kind=$(tg_classify_builtin "$norm")
+  case "${kind%%|*}" in
+    heavy | light | none)
+      rule=$(tg_user_rule "$norm")
+      [ -n "$rule" ] && kind="${rule%% *}|$rule" ;;
+  esac
+  echo "$kind"
+}
+
+# $1 is a normalized simple command.
+tg_classify_builtin() {
+  local w1 name="" sub a has_file=0 watch=0 light_flag=0 inner rest=""
+  local heavy_scripts=$TG_HEAVY_SCRIPTS always_heavy=$TG_ALWAYS_HEAVY
+
+  set -f
+  # shellcheck disable=SC2086
+  set -- $1
+  set +f
   [ $# -gt 0 ] || { echo none; return; }
 
   w1=${1##*/}
@@ -64,6 +110,7 @@ tg_classify_segment() {
         case "$1" in --light) light_flag=1; shift ;; --heavy) shift ;; --) shift; break ;; *) break ;; esac
       done
       inner=$(tg_classify_segment "$*")
+      inner=${inner%%|*}
       if [ "$inner" = watch ]; then echo watch
       elif [ $light_flag = 1 ] && [ "$inner" = heavy ]; then echo misuse
       else echo gated; fi
@@ -184,17 +231,19 @@ tg_split_command() {
 }
 
 tg_classify() {
-  local seg kind best=none best_seg=""
+  local seg kind best=none best_seg="" best_rule=""
   while IFS= read -r seg; do
     seg=$(printf '%s' "$seg" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     [ -n "$seg" ] || continue
     kind=$(tg_classify_segment "$seg")
-    if [ "$(tg_kind_rank "$kind")" -gt "$(tg_kind_rank "$best")" ]; then
-      best=$kind
-      best_seg=$seg
+    if [ "$(tg_kind_rank "${kind%%|*}")" -gt "$(tg_kind_rank "$best")" ]; then
+      best=${kind%%|*}
+      best_seg=$(printf '%s' "$seg" | tr '\t' ' ') # TAB separates the output fields
+      best_rule=""
+      case "$kind" in *"|"*) best_rule=${kind#*|} ;; esac
     fi
   done <<EOF
 $(tg_split_command "$1")
 EOF
-  printf '%s\t%s\n' "$best" "$best_seg"
+  printf '%s\t%s\t%s\n' "$best" "$best_seg" "$best_rule"
 }

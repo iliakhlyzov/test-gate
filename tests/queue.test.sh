@@ -6,6 +6,8 @@ TMP_ROOT=$(mktemp -d)
 TEST_GATE_HOME="$TMP_ROOT/App Support/test-gate"
 export TEST_GATE_HOME
 mkdir -p "$TEST_GATE_HOME"
+# Built-in rules only: do not read the rules file of the person who runs the tests.
+export TEST_GATE_RULES=/nonexistent
 export TEST_GATE_MIN_DISK_GB=0 TEST_GATE_POLL=0.2 TEST_GATE_REPORT_EVERY=1
 trap 'rm -rf "$TMP_ROOT"' EXIT
 fail=0

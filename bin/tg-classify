@@ -1,0 +1,41 @@
+#!/bin/bash
+# tg-classify - show how the Claude Code hook sees a command.
+#
+#   tg-classify "<command>"      e.g.  tg-classify "yarn test:it src/a.test.ts"
+#
+# Prints the kind, the part of the command that decided it, and the rule
+# (built-in or a line from your rules file).
+set -u
+
+tg_self=$0
+while [ -L "$tg_self" ]; do
+  link=$(readlink "$tg_self")
+  case "$link" in /*) tg_self=$link ;; *) tg_self=$(dirname "$tg_self")/$link ;; esac
+done
+TG_ROOT=$(cd "$(dirname "$tg_self")/.." && pwd)
+# shellcheck source=../lib/classify.sh
+. "$TG_ROOT/lib/classify.sh"
+
+if [ $# -eq 0 ] || [ "$1" = -h ] || [ "$1" = --help ]; then
+  sed -n '2,7p' "$tg_self" | sed 's/^# \{0,1\}//' >&2
+  exit 64
+fi
+
+IFS='	' read -r kind part rule <<EOF
+$(tg_classify "$*")
+EOF
+if [ -n "$rule" ]; then rule="$rule  ($(tg_rules_file))"; else rule="built-in"; fi
+
+case "$kind" in
+  watch) means="blocked: watch mode never ends" ;;
+  misuse) means="blocked: tg-run --light is only for explicit test files" ;;
+  heavy) means="blocked unless it runs as: tg-run -- <command>" ;;
+  light) means="allowed without the queue (blocked only when memory pressure is critical)" ;;
+  gated) means="allowed: already goes through tg-run" ;;
+  *) means="allowed: not a test command" ;;
+esac
+
+echo "kind:  $kind"
+[ -n "$part" ] && echo "part:  $part"
+echo "rule:  $rule"
+echo "means: $means"

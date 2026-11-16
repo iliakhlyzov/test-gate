@@ -31,9 +31,9 @@ elif command -v python3 >/dev/null 2>&1; then
 fi
 [ -n "$cmd" ] || exit 0
 
-result=$(tg_classify "$cmd")
-kind=${result%%	*}
-seg=${result#*	}
+IFS='	' read -r kind seg _rule <<EOF
+$(tg_classify "$cmd")
+EOF
 
 tgrun=tg-run
 command -v tg-run >/dev/null 2>&1 || tgrun="$TG_ROOT/bin/tg-run"

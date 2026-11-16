@@ -47,6 +47,8 @@ to `~/.zshrc`. To remove everything: `install.sh --uninstall`.
 Then give your agents the instructions from [docs/agents.md](docs/agents.md):
 add them to `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`.
 
+A real example of this work, with numbers: [docs/example.md](docs/example.md).
+
 ## The experiment (3–5 days)
 
 Goal: zero "Force Quit Applications" windows, and a clear answer to the

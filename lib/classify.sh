@@ -17,7 +17,8 @@
 
 TG_RUNNERS='^(jest|vitest|mocha|ava|playwright|cypress)$'
 TG_HEAVY_SCRIPTS='^(test|tests|e2e|integration|ci|(test|e2e|integration)[:-].*)$'
-TG_ALWAYS_HEAVY='e2e|integration|playwright|cypress|testcontainers'
+# "it" as its own part of a script name means integration tests: test:it, test-it:db.
+TG_ALWAYS_HEAVY='e2e|integration|playwright|cypress|testcontainers|(^|[:-])it([:-]|[[:space:]]|$)'
 TG_WATCH_SCRIPTS='(^|[:-])watch($|[:-])'
 TG_MAKE_TARGETS='^(test|tests|e2e|check|integration|ci)$'
 

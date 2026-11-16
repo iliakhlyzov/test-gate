@@ -131,7 +131,7 @@ inside it.
   `timeout`, `caffeinate` and `bash -c "..."` are understood too.
 - **Light, no queue:** a run with explicit test files, like
   `yarn test src/a.test.ts`. A run is still heavy if the script name or the
-  options say e2e, integration or playwright.
+  options say e2e, integration, playwright or `it` (like `test:it`).
 - **Blocked:** watch mode (`--watch`, `--watchAll`, scripts like `test:watch`),
   and `tg-run --light` for a heavy run.
 

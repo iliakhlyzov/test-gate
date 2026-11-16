@@ -46,7 +46,7 @@ sleep 0.5
 kill -TERM $runner; wait $runner 2>/dev/null
 sleep 0.3
 [ -z "$(ls "$TEST_GATE_HOME/slots")" ] && ok "slot freed after SIGTERM" || bad "slot still taken after SIGTERM"
-pgrep -f 'sleep 300' >/dev/null && { bad "command survived SIGTERM"; pkill -f 'sleep 300'; } || ok "command killed on SIGTERM"
+pgrep -f '^sleep 300' >/dev/null && { bad "command survived SIGTERM"; pkill -f '^sleep 300'; } || ok "command killed on SIGTERM"
 
 # 6. A slot held by a dead process is reclaimed.
 printf 'pid=999999\nclass=heavy\nsince=0\ncwd=/\ncmd=ghost\n' >"$TEST_GATE_HOME/slots/1"
@@ -84,9 +84,9 @@ bin/tg-run -- sh -c 'sleep 301' 2>/dev/null &
 runner=$!
 sleep 0.5
 kill -KILL $runner; wait $runner 2>/dev/null
-pgrep -f 'sleep 301' >/dev/null && ok "orphan alive right after kill -9 (expected)" || bad "orphan setup"
+pgrep -f '^sleep 301' >/dev/null && ok "orphan alive right after kill -9 (expected)" || bad "orphan setup"
 timeout 10 bin/tg-run -- true 2>/dev/null && ok "next run starts after kill -9" || bad "queue stuck after kill -9"
-pgrep -f 'sleep 301' >/dev/null && { bad "orphaned command not cleaned up"; pkill -f 'sleep 301'; } || ok "orphaned command killed before next run"
+pgrep -f '^sleep 301' >/dev/null && { bad "orphaned command not cleaned up"; pkill -f '^sleep 301'; } || ok "orphaned command killed before next run"
 
 # 9c. Slot owned by a live process with a different start time (reused pid) is stale.
 printf 'pid=%s\npstart=Mon Jan  1 00:00:00 2001\nclass=heavy\nsince=0\ncwd=/\ncmd=old\n' $$ >"$TEST_GATE_HOME/slots/1"

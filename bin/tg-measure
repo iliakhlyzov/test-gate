@@ -1,0 +1,107 @@
+#!/bin/bash
+# tg-measure - run a command once and report how much memory it really takes.
+#
+#   tg-measure [--] <command> [args...]      e.g.  tg-measure yarn test
+#
+# Samples the RSS of the whole process tree (the command, its workers,
+# browsers it launches) every TEST_GATE_MEASURE_INTERVAL seconds (default 1)
+# and appends the result to measurements.csv. It does not use the queue:
+# measure on an otherwise quiet machine.
+set -u
+
+tg_self=$0
+while [ -L "$tg_self" ]; do
+  link=$(readlink "$tg_self")
+  case "$link" in /*) tg_self=$link ;; *) tg_self=$(dirname "$tg_self")/$link ;; esac
+done
+TG_ROOT=$(cd "$(dirname "$tg_self")/.." && pwd)
+# shellcheck source=../lib/common.sh
+. "$TG_ROOT/lib/common.sh"
+
+[ "${1:-}" = -- ] && shift
+if [ $# -eq 0 ] || [ "$1" = -h ] || [ "$1" = --help ]; then
+  sed -n '2,10p' "$tg_self" | sed 's/^# \{0,1\}//' >&2
+  exit 64
+fi
+
+INTERVAL=${TEST_GATE_MEASURE_INTERVAL:-1}
+cmd_text=$(printf '%s ' "$@" | tr '\n' ' ')
+cmd_text=${cmd_text% }
+tmp=$(mktemp "${TMPDIR:-/tmp}/tg-measure.XXXXXX")
+
+# RSS (MB) and process count of the tree rooted at $1, plus its process group.
+tree_mem() {
+  ps -axo pid=,ppid=,pgid=,rss= 2>/dev/null | awk -v R="$1" '
+    { pp[$1] = $2; pg[$1] = $3; rss[$1] = $4 }
+    END {
+      for (p in rss) {
+        hit = (pg[p] == R)
+        q = p
+        for (i = 0; !hit && i < 64 && q > 1; i++) { if (q == R) hit = 1; q = pp[q] }
+        if (hit) { s += rss[p]; n++ }
+      }
+      printf "%d %d\n", s / 1024, n
+    }'
+}
+
+sampler() {
+  local vm
+  while :; do
+    vm=$(tg_proc_categories | cut -d, -f5)
+    echo "$(tree_mem "$1") $(tg_pressure_level) $(tg_swap_used_mb) $(tg_disk_free_gb) $vm" >>"$tmp"
+    sleep "$INTERVAL"
+  done
+}
+
+swap0=$(tg_swap_used_mb)
+interrupted=0
+start=$(tg_now)
+echo "[test-gate] measuring: $cmd_text" >&2
+
+set -m
+env "$@" &
+child=$!
+set +m
+sampler "$child" &
+spid=$!
+
+trap 'interrupted=1; tg_kill_group "$child"' INT TERM HUP
+wait "$child"
+rc=$?
+if [ $interrupted = 1 ]; then wait "$child" 2>/dev/null; rc=130; fi
+kill "$spid" 2>/dev/null
+wait "$spid" 2>/dev/null
+dur=$(($(tg_now) - start))
+left=$(tg_group_count "$child")
+
+read -r peak_mb peak_n worst_p peak_swap min_disk peak_vm <<EOF
+$(awk '
+  NR == 1 { md = $5 }
+  { if ($1 > m) m = $1; if ($2 > n) n = $2; if ($3 > p) p = $3
+    if ($4 > s) s = $4; if ($5 < md) md = $5; if ($6 > v) v = $6 }
+  END { printf "%d %d %d %d %d %d\n", m, n, (p ? p : 1), s, md, v }' "$tmp")
+EOF
+rm -f "$tmp"
+[ "$peak_swap" -lt "$swap0" ] && peak_swap=$swap0
+
+{
+  echo "──────── test-gate measure ────────"
+  echo "command          $cmd_text"
+  echo "duration         $(tg_fmt_dur $dur) (exit $rc)"
+  echo "peak memory      $(tg_fmt_gb "$peak_mb") in $peak_n processes  (RSS of the process tree)"
+  echo "Mac RAM          $(tg_fmt_gb "$(tg_ram_mb)")"
+  echo "worst pressure   $(tg_pressure_name "$worst_p")"
+  echo "swap used        $(tg_fmt_gb "$swap0") before, $(tg_fmt_gb "$peak_swap") peak"
+  echo "lowest free disk ${min_disk} GB"
+  echo "VMs (Docker...)  $(tg_fmt_gb "$peak_vm") peak, not included above"
+  if [ "$left" -gt 0 ]; then
+    echo "LEFTOVERS        $left process(es) of this run are still running after it ended!"
+  fi
+  echo "───────────────────────────────────"
+} >&2
+
+m="$TG_LOGS/measurements.csv"
+[ -f "$m" ] || echo 'ts,duration_s,exit,peak_mb,peak_procs,worst_pressure,swap_before_mb,swap_peak_mb,min_disk_gb,vm_peak_mb,leftovers,cwd,cmd' >"$m"
+echo "$(tg_ts),$dur,$rc,$peak_mb,$peak_n,$worst_p,$swap0,$peak_swap,$min_disk,$peak_vm,$left,$(printf '%s' "$PWD" | tr ',' '_'),$(printf '%s' "$cmd_text" | tr ',' ' ')" >>"$m"
+
+exit $rc

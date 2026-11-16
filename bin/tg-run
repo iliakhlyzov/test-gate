@@ -1,0 +1,195 @@
+#!/bin/bash
+# tg-run - run a heavy command through a machine-wide queue.
+#
+#   tg-run [--light] [--] <command> [args...]
+#
+# Heavy runs (default) wait in a FIFO queue; only TEST_GATE_SLOTS of them run
+# at once. Light runs skip the queue and only wait while memory is critical.
+# The command runs in its own process group; leftovers (jest workers,
+# browsers) are killed when it ends or when tg-run is interrupted.
+set -u
+
+tg_self=$0
+while [ -L "$tg_self" ]; do
+  link=$(readlink "$tg_self")
+  case "$link" in /*) tg_self=$link ;; *) tg_self=$(dirname "$tg_self")/$link ;; esac
+done
+TG_ROOT=$(cd "$(dirname "$tg_self")/.." && pwd)
+# shellcheck source=../lib/common.sh
+. "$TG_ROOT/lib/common.sh"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: tg-run [--light] [--] <command> [args...]
+
+  tg-run -- yarn test                 heavy: waits for a free slot
+  tg-run --light -- yarn test a.test.ts   light: no queue, waits only if memory is critical
+  tg-run -- bash -c 'cd app && yarn test'  compound commands
+
+Environment:
+  TEST_GATE_SLOTS=1           heavy runs allowed at the same time
+  TEST_GATE_MAX_PRESSURE=2    start only while pressure <= this (1 normal, 2 warn, 4 critical)
+  TEST_GATE_MIN_DISK_GB=15    start only with this much free space for swap
+  TEST_GATE_MAX_WAIT=0        give up after N seconds of waiting (0 = never), exit 75
+  TEST_GATE_REPORT_EVERY=30   seconds between "still waiting" messages
+  TEST_GATE_KILL_LEFTOVERS=1  kill processes left in the group after the command ends
+EOF
+  exit 64
+}
+
+class=heavy
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --light) class=light; shift ;;
+    --heavy) class=heavy; shift ;;
+    -h | --help) usage ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+[ $# -gt 0 ] || usage
+
+SLOTS=${TEST_GATE_SLOTS:-1}
+MAX_PRESSURE=${TEST_GATE_MAX_PRESSURE:-2}
+MAX_WAIT=${TEST_GATE_MAX_WAIT:-0}
+REPORT_EVERY=${TEST_GATE_REPORT_EVERY:-30}
+KILL_LEFTOVERS=${TEST_GATE_KILL_LEFTOVERS:-1}
+POLL=${TEST_GATE_POLL:-2}
+
+say() { printf '[test-gate] %s\n' "$*" >&2; }
+
+cmd_text=$(printf '%s ' "$@" | tr '\n' ' ')
+cmd_text=${cmd_text% }
+my_file=""
+child=""
+wait_start=$(tg_now)
+
+write_info() {
+  printf 'pid=%s\nclass=%s\nsince=%s\ncwd=%s\ncmd=%s\n' \
+    "$$" "$class" "$(tg_now)" "$PWD" "$cmd_text" >"$1"
+}
+
+cleanup() {
+  tg_mutex_unlock
+  [ -n "$child" ] && tg_kill_group "$child"
+  [ -n "$my_file" ] && rm -f "$my_file"
+  child=""
+  my_file=""
+}
+on_signal() {
+  say "interrupted: stopping the command and leaving the queue"
+  cleanup
+  exit "$1"
+}
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+trap 'on_signal 129' HUP
+trap cleanup EXIT
+
+running_brief() {
+  local f out=""
+  for f in "$TG_HOME/slots"/*; do
+    [ -f "$f" ] || continue
+    out="$out${out:+; }$(tg_describe "$f")"
+  done
+  printf '%s' "${out:-nothing (waiting for resources)}"
+}
+
+# Prints a waiting message on the first poll and then every REPORT_EVERY seconds.
+reported_at=-1
+report() {
+  local waited=$(($(tg_now) - wait_start))
+  if [ $reported_at -lt 0 ] || [ $((waited - reported_at)) -ge "$REPORT_EVERY" ]; then
+    say "$1 Waited $(tg_fmt_dur $waited). This is expected: keep waiting, do not change, split or bypass this command."
+    reported_at=$waited
+  fi
+  if [ "$MAX_WAIT" -gt 0 ] && [ $waited -ge "$MAX_WAIT" ]; then
+    say "GAVE UP after $(tg_fmt_dur $waited) (TEST_GATE_MAX_WAIT=$MAX_WAIT). The command did NOT run. Tell the user; do not run it without tg-run."
+    exit 75
+  fi
+}
+
+# ------------------------------------------------------------------- admission
+if [ "$class" = heavy ]; then
+  tg_mutex_lock
+  n=$(cat "$TG_HOME/seq" 2>/dev/null)
+  n=$((${n:-0} + 1))
+  echo "$n" >"$TG_HOME/seq"
+  my_file="$TG_HOME/queue/$(printf '%010d' "$n")-$$"
+  write_info "$my_file"
+  tg_mutex_unlock
+
+  while :; do
+    tg_mutex_lock
+    tg_cleanup_stale
+    pos=$(ls "$TG_HOME/queue" | sort | grep -n -- "-$$\$" | cut -d: -f1)
+    qlen=$(tg_count_files "$TG_HOME/queue")
+    free="" nfree=0 i=1
+    while [ $i -le "$SLOTS" ]; do
+      [ -e "$TG_HOME/slots/$i" ] || { free="$free $i"; nfree=$((nfree + 1)); }
+      i=$((i + 1))
+    done
+    block=""
+    if [ "${pos:-1}" -le "$nfree" ]; then
+      block=$(tg_block_reason "$MAX_PRESSURE")
+      if [ -z "$block" ]; then
+        slot=$(echo $free | tr ' ' '\n' | sed -n "${pos:-1}p")
+        rm -f "$my_file"
+        my_file="$TG_HOME/slots/$slot"
+        write_info "$my_file"
+        tg_mutex_unlock
+        break
+      fi
+    fi
+    tg_mutex_unlock
+    if [ -n "$block" ]; then
+      report "WAITING: $block."
+    else
+      report "QUEUED: position $pos of $qlen. Running now: $(running_brief)."
+    fi
+    sleep "$POLL"
+  done
+  say "RUNNING (slot $slot of $SLOTS, waited $(tg_fmt_dur $(($(tg_now) - wait_start)))): $cmd_text"
+else
+  my_file="$TG_HOME/light/$$"
+  write_info "$my_file"
+  while :; do
+    block=$(tg_block_reason 2)
+    [ -z "$block" ] && break
+    report "WAITING (light run): $block."
+    sleep "$POLL"
+  done
+fi
+
+# ------------------------------------------------------------------------- run
+run_start=$(tg_now)
+set -m # job control: the command gets its own process group (pgid = $child)
+env "$@" &
+child=$!
+set +m
+wait "$child"
+rc=$?
+
+left=$(tg_group_count "$child")
+if [ "$left" -gt 0 ]; then
+  if [ "$KILL_LEFTOVERS" = 1 ]; then
+    say "cleaning up $left leftover process(es) of this run (workers, browsers, servers)"
+    tg_kill_group "$child"
+  else
+    say "warning: $left process(es) of this run are still alive (TEST_GATE_KILL_LEFTOVERS=0)"
+  fi
+fi
+child=""
+rm -f "$my_file"
+my_file=""
+
+dur=$(($(tg_now) - run_start))
+waited=$((run_start - wait_start))
+say "DONE in $(tg_fmt_dur $dur) (exit $rc)"
+
+runs="$TG_LOGS/runs.csv"
+[ -f "$runs" ] || echo 'started,class,waited_s,duration_s,exit,cwd,cmd' >"$runs"
+printf '%s,%s,%s,%s,%s,%s,%s\n' "$(date -r "$run_start" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || date -d "@$run_start" '+%Y-%m-%dT%H:%M:%S')" \
+  "$class" "$waited" "$dur" "$rc" "$(printf '%s' "$PWD" | tr ',' '_')" "$(printf '%s' "$cmd_text" | tr ',' ' ')" >>"$runs"
+
+exit $rc

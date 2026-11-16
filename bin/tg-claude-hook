@@ -1,0 +1,86 @@
+#!/bin/bash
+# tg-claude-hook - Claude Code PreToolUse hook (matcher "Bash").
+#
+# Blocks heavy test commands that are not wrapped in tg-run and tells the
+# agent how to re-run them (exit code 2 = block, stderr goes to the agent).
+# Light runs (explicit test files) pass, unless memory pressure is critical.
+# Disable temporarily with TEST_GATE_HOOK=off.
+set -u
+
+tg_self=$0
+while [ -L "$tg_self" ]; do
+  link=$(readlink "$tg_self")
+  case "$link" in /*) tg_self=$link ;; *) tg_self=$(dirname "$tg_self")/$link ;; esac
+done
+TG_ROOT=$(cd "$(dirname "$tg_self")/.." && pwd)
+# shellcheck source=../lib/common.sh
+. "$TG_ROOT/lib/common.sh"
+# shellcheck source=../lib/classify.sh
+. "$TG_ROOT/lib/classify.sh"
+
+[ "${TEST_GATE_HOOK:-on}" = off ] && exit 0
+
+input=$(cat)
+cmd=""
+if command -v jq >/dev/null 2>&1; then
+  cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)
+elif command -v osascript >/dev/null 2>&1; then
+  cmd=$(osascript -l JavaScript -e 'function run(a){try{return JSON.parse(a[0]).tool_input.command||""}catch(e){return ""}}' "$input" 2>/dev/null)
+elif command -v python3 >/dev/null 2>&1; then
+  cmd=$(printf '%s' "$input" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tool_input",{}).get("command",""))' 2>/dev/null)
+fi
+[ -n "$cmd" ] || exit 0
+
+result=$(tg_classify "$cmd")
+kind=${result%%	*}
+seg=${result#*	}
+
+tgrun=tg-run
+command -v tg-run >/dev/null 2>&1 || tgrun="$TG_ROOT/bin/tg-run"
+
+# Suggest an exact rewrite when the segment can be found verbatim.
+suggest() { # $1 = flags for tg-run
+  local fixed
+  fixed=$(TG_C=$cmd TG_S=$seg TG_R="$tgrun $1-- $seg" awk 'BEGIN {
+    c = ENVIRON["TG_C"]; s = ENVIRON["TG_S"]; r = ENVIRON["TG_R"]
+    i = index(c, s); if (i == 0) exit
+    print substr(c, 1, i - 1) r substr(c, i + length(s)) }')
+  if [ -n "$fixed" ]; then
+    echo "Re-run it as:"
+    echo "  $fixed"
+  else
+    echo "Re-run it with the test part prefixed by \`$tgrun $1--\` (for compound commands: \`$tgrun $1-- bash -c '...'\`)."
+  fi
+}
+
+case "$kind" in
+  watch)
+    {
+      echo "test-gate: blocked a test runner in watch mode (\`$seg\`)."
+      echo "Watch mode never exits and keeps memory busy. Run the tests once instead (drop --watch/--watchAll, or for vitest use \`vitest run\`)."
+    } >&2
+    exit 2
+    ;;
+  heavy)
+    {
+      echo "test-gate: blocked a heavy test command (\`$seg\`)."
+      echo "Heavy test runs on this Mac go through a machine-wide queue so parallel agents do not run out of memory."
+      suggest ""
+      echo "Prefer run_in_background: true; the queue can take minutes."
+      echo "If tg-run prints QUEUED or WAITING, that is expected: wait for it. Do not change the command, reduce or skip tests, or start the runner another way to get around the queue."
+    } >&2
+    exit 2
+    ;;
+  light)
+    p=$(tg_pressure_level)
+    if [ "$p" -ge 4 ]; then
+      {
+        echo "test-gate: memory pressure is critical right now, so even this small test run (\`$seg\`) has to wait."
+        suggest "--light "
+        echo "tg-run --light waits until memory recovers and then runs the command."
+      } >&2
+      exit 2
+    fi
+    ;;
+esac
+exit 0

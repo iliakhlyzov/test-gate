@@ -1,0 +1,84 @@
+#!/bin/bash
+# tg-status - what is running and waiting in the test-gate queue.
+#
+#   tg-status              human-readable
+#   tg-status --swiftbar   output for the SwiftBar menu bar plugin
+set -u
+
+tg_self=$0
+while [ -L "$tg_self" ]; do
+  link=$(readlink "$tg_self")
+  case "$link" in /*) tg_self=$link ;; *) tg_self=$(dirname "$tg_self")/$link ;; esac
+done
+TG_ROOT=$(cd "$(dirname "$tg_self")/.." && pwd)
+# shellcheck source=../lib/common.sh
+. "$TG_ROOT/lib/common.sh"
+
+mode=${1:-text}
+
+# Stale entries are removed opportunistically.
+tg_mutex_lock
+tg_cleanup_stale
+tg_mutex_unlock
+
+p=$(tg_pressure_level)
+pname=$(tg_pressure_name "$p")
+free_pct=$(tg_mem_free_pct)
+swap=$(tg_swap_used_mb)
+comp=$(tg_compressed_mb)
+disk=$(tg_disk_free_gb)
+nrun=$(tg_count_files "$TG_HOME/slots")
+nq=$(tg_count_files "$TG_HOME/queue")
+nlight=$(tg_count_files "$TG_HOME/light")
+logger="off"
+if [ -f "$TG_HOME/logger.pid" ] && kill -0 "$(cat "$TG_HOME/logger.pid")" 2>/dev/null; then logger="on"; fi
+
+list() { # $1 = dir; prints "<file>\t<description>" sorted by name (= queue order)
+  local f
+  for f in $(ls "$TG_HOME/$1" 2>/dev/null | sort); do
+    printf '%s\t%s\n' "$TG_HOME/$1/$f" "$(tg_describe "$TG_HOME/$1/$f")"
+  done
+}
+
+if [ "$mode" = --swiftbar ]; then
+  case "$p" in 1) dot="🟢" ;; 2) dot="🟡" ;; *) dot="🔴" ;; esac
+  if [ "$nrun" -eq 0 ] && [ "$nq" -eq 0 ] && [ "$nlight" -eq 0 ]; then
+    echo "$dot"
+  else
+    title="$dot ▶$((nrun + nlight))"
+    [ "$nq" -gt 0 ] && title="$title ⏳$nq"
+    echo "$title"
+  fi
+  echo "---"
+  echo "Memory: $pname · available ${free_pct}% | color=$([ "$p" = 1 ] && echo gray || echo red)"
+  echo "Swap $(tg_fmt_gb "$swap") · compressed $(tg_fmt_gb "$comp") · disk ${disk} GB free"
+  echo "---"
+  section() { # $1 dir, $2 title
+    echo "$2"
+    list "$1" | while IFS="$(printf '\t')" read -r file desc; do
+      pid=$(tg_field "$file" pid)
+      echo "$desc | font=Menlo size=12"
+      echo "--Stop | bash=/bin/kill param1=-TERM param2=$pid terminal=false refresh=true"
+    done
+  }
+  [ "$nrun" -gt 0 ] && section slots "Running"
+  [ "$nlight" -gt 0 ] && section light "Light runs"
+  [ "$nq" -gt 0 ] && section queue "Queued"
+  [ "$nrun" -eq 0 ] && [ "$nq" -eq 0 ] && [ "$nlight" -eq 0 ] && echo "Nothing running"
+  echo "---"
+  echo "Logger: $logger"
+  echo "Open logs folder | bash=/usr/bin/open param1=\"$TG_LOGS\" terminal=false"
+  echo "Refresh | refresh=true"
+  exit 0
+fi
+
+echo "memory   $pname · available ${free_pct}% · swap $(tg_fmt_gb "$swap") · compressed $(tg_fmt_gb "$comp") · disk ${disk} GB free"
+echo "logger   $logger"
+echo "running  ($nrun of ${TEST_GATE_SLOTS:-1} slots)"
+list slots | cut -f2 | sed 's/^/  ▶ /'
+if [ "$nlight" -gt 0 ]; then
+  echo "light    ($nlight)"
+  list light | cut -f2 | sed 's/^/  · /'
+fi
+echo "queued   ($nq)"
+list queue | cut -f2 | awk '{ printf "  %d. %s\n", NR, $0 }'

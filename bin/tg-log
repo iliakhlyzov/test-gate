@@ -1,0 +1,123 @@
+#!/bin/bash
+# tg-log - background logger of memory, swap, disk and test processes.
+#
+#   tg-log start | stop | status   manage the background logger
+#   tg-log run                     log in the foreground
+#   tg-log mark [note]             record "it froze just now" with a snapshot
+#   tg-log summary [days]          what happened (default: all logged days)
+set -u
+
+tg_self=$0
+while [ -L "$tg_self" ]; do
+  link=$(readlink "$tg_self")
+  case "$link" in /*) tg_self=$link ;; *) tg_self=$(dirname "$tg_self")/$link ;; esac
+done
+TG_ROOT=$(cd "$(dirname "$tg_self")/.." && pwd)
+# shellcheck source=../lib/common.sh
+. "$TG_ROOT/lib/common.sh"
+
+INTERVAL=${TEST_GATE_LOG_INTERVAL:-15}
+PIDFILE="$TG_HOME/logger.pid"
+COLS='pressure,mem_free_pct,swap_mb,compressed_mb,disk_free_gb,jest_runs,playwright_runs,gate_running,gate_queued,node_n,node_mb,browser_n,browser_mb,vm_mb,top1,top1_mb,top2,top2_mb,top3,top3_mb'
+
+snapshot() { # everything after the timestamp
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$(tg_pressure_level)" "$(tg_mem_free_pct)" \
+    "$(tg_swap_used_mb)" "$(tg_compressed_mb)" "$(tg_disk_free_gb)" "$(tg_runner_counts)" \
+    "$(tg_count_files "$TG_HOME/slots")" "$(tg_count_files "$TG_HOME/queue")" "$(tg_proc_categories)"
+}
+
+samples_file() { echo "$TG_LOGS/samples-$(date +%Y-%m-%d).csv"; }
+
+logger_pid() {
+  local p
+  p=$(cat "$PIDFILE" 2>/dev/null) || return 1
+  kill -0 "$p" 2>/dev/null && echo "$p"
+}
+
+cmd=${1:-status}
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+  run)
+    while :; do
+      f=$(samples_file)
+      [ -f "$f" ] || echo "ts,$COLS" >"$f"
+      echo "$(tg_ts),$(snapshot)" >>"$f"
+      sleep "$INTERVAL"
+    done
+    ;;
+
+  start)
+    if p=$(logger_pid); then echo "logger already running (pid $p)"; exit 0; fi
+    nohup "$TG_ROOT/bin/tg-log" run >>"$TG_LOGS/logger.out" 2>&1 &
+    echo $! >"$PIDFILE"
+    echo "logger started (pid $!, every ${INTERVAL}s) -> $TG_LOGS"
+    echo "note: it does not survive a reboot; run 'tg-log start' again after restarting the Mac"
+    ;;
+
+  stop)
+    if p=$(logger_pid); then kill "$p" && rm -f "$PIDFILE" && echo "logger stopped"; else echo "logger is not running"; fi
+    ;;
+
+  status)
+    if p=$(logger_pid); then echo "logger running (pid $p, every ${INTERVAL}s)"; else echo "logger not running"; fi
+    echo "logs: $TG_LOGS"
+    f=$(samples_file)
+    [ -f "$f" ] && { echo "last sample:"; head -n 1 "$f"; tail -n 1 "$f"; }
+    ;;
+
+  mark)
+    f="$TG_LOGS/events.csv"
+    [ -f "$f" ] || echo "ts,note,$COLS" >"$f"
+    note=$(printf '%s' "${*:-freeze}" | tr ',\n' '; ')
+    echo "$(tg_ts),$note,$(snapshot)" >>"$f"
+    echo "marked: $note"
+    ;;
+
+  summary)
+    days=${1:-0}
+    files=$(ls "$TG_LOGS"/samples-*.csv 2>/dev/null | sort)
+    [ "$days" -gt 0 ] && files=$(printf '%s\n' "$files" | tail -n "$days")
+    if [ -z "$files" ]; then echo "no samples yet: start the logger with 'tg-log start'"; exit 0; fi
+    echo "RAM: $(tg_fmt_gb "$(tg_ram_mb)")"
+    # shellcheck disable=SC2086
+    awk -F, '
+      FNR == 1 { next }
+      { n++; pc[$2]++; if (first == "") first = $1; last = $1
+        if ($4 > swap) { swap = $4; swap_at = $1 }
+        if ($5 > comp) comp = $5
+        if (mind == "" || $6 < mind) { mind = $6; mind_at = $1 }
+        if ($7 > jest) jest = $7
+        if ($8 > pw) pw = $8
+        if ($10 > q) q = $10
+        if ($12 > node) { node = $12; node_at = $1 }
+        if ($14 > br) br = $14
+        if ($15 > vm) vm = $15
+        if ($2 >= 2 && bad < 15) { bad_lines[++bad] = sprintf("  %s  %-8s swap %5d MB  top: %s %d MB, %s %d MB", $1, ($2 == 4 ? "critical" : "warn"), $4, $16, $17, $18, $19) }
+      }
+      END {
+        printf "samples: %d, from %s to %s\n", n, first, last
+        printf "pressure: normal %d, warn %d, critical %d samples\n", pc[1], pc[2], pc[4]
+        printf "peak swap used: %d MB at %s\n", swap, swap_at
+        printf "peak compressed memory: %d MB\n", comp
+        printf "lowest free disk: %d GB at %s\n", mind, mind_at
+        printf "peak node processes total: %d MB at %s\n", node, node_at
+        printf "peak browsers total: %d MB, peak VM (Docker etc.): %d MB\n", br, vm
+        printf "max concurrent jest runs: %d, playwright runs: %d, queued in test-gate: %d\n", jest, pw, q
+        if (bad) { print "first moments with elevated pressure:"; for (i = 1; i <= bad; i++) print bad_lines[i] }
+      }' $files
+    if [ -f "$TG_LOGS/events.csv" ]; then
+      echo "marked events:"
+      awk -F, 'NR > 1 { printf "  %s  %s  (pressure %s, swap %s MB, top: %s %s MB)\n", $1, $2, $3, $5, $17, $18 }' "$TG_LOGS/events.csv"
+    fi
+    if [ -f "$TG_LOGS/runs.csv" ]; then
+      awk -F, 'NR > 1 { n++; w += $3; if ($3 > mw) mw = $3; d += $4 }
+        END { if (n) printf "gated runs: %d, avg wait %ds, max wait %ds, avg duration %ds\n", n, w / n, mw, d / n }' "$TG_LOGS/runs.csv"
+    fi
+    ;;
+
+  *)
+    sed -n '2,9p' "$tg_self" | sed 's/^# \{0,1\}//'
+    exit 64
+    ;;
+esac

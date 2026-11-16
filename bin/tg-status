@@ -57,7 +57,8 @@ if [ "$mode" = --swiftbar ]; then
     echo "$2"
     list "$1" | while IFS="$(printf '\t')" read -r file desc; do
       pid=$(tg_field "$file" pid)
-      echo "$desc | font=Menlo size=12"
+      # "|" separates SwiftBar parameters, so it cannot appear in the text.
+      echo "$(printf '%s' "$desc" | tr '|' '¦') | font=Menlo size=12"
       echo "--Stop | bash=/bin/kill param1=-TERM param2=$pid terminal=false refresh=true"
     done
   }

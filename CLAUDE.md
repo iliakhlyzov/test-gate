@@ -6,7 +6,7 @@
 - No runtime dependencies beyond what macOS ships. `jq` is optional.
 - Linux fallbacks in `lib/common.sh` exist only so the tests run in CI or in
   a Linux container.
-- Agent-facing messages (tg-run, the hook, docs/agents.md) are in English;
-  README is in Russian.
+- Everything in the repo is in simple English (B1 level): code, messages,
+  docs, commit messages.
 - Run `tests/classify.test.sh` and `tests/queue.test.sh` after changes, and
   `shellcheck -x -S warning bin/* lib/*.sh install.sh swiftbar/*.sh tests/*.sh`.

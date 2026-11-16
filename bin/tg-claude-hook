@@ -71,6 +71,14 @@ case "$kind" in
     } >&2
     exit 2
     ;;
+  misuse)
+    {
+      echo "test-gate: blocked \`$seg\`."
+      echo "\`tg-run --light\` is only for runs with explicit test files. This command runs a heavy suite, so it must wait in the queue."
+      echo "Run it again without --light: \`tg-run -- ...\`. If it prints QUEUED, wait for it."
+    } >&2
+    exit 2
+    ;;
   light)
     p=$(tg_pressure_level)
     if [ "$p" -ge 4 ]; then

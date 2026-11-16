@@ -1,10 +1,13 @@
 #!/bin/bash
 # Integration tests for tg-run / tg-status / tg-claude-hook. Run: tests/queue.test.sh
 cd "$(dirname "$0")/.." || exit 1
-TEST_GATE_HOME=$(mktemp -d)
+# The path has a space on purpose, like "~/Library/Application Support".
+TMP_ROOT=$(mktemp -d)
+TEST_GATE_HOME="$TMP_ROOT/App Support/test-gate"
 export TEST_GATE_HOME
+mkdir -p "$TEST_GATE_HOME"
 export TEST_GATE_MIN_DISK_GB=0 TEST_GATE_POLL=0.2 TEST_GATE_REPORT_EVERY=1
-trap 'rm -rf "$TEST_GATE_HOME"' EXIT
+trap 'rm -rf "$TMP_ROOT"' EXIT
 fail=0
 ok() { echo "ok    $1"; }
 bad() { echo "FAIL  $1"; fail=1; }
@@ -12,7 +15,7 @@ bad() { echo "FAIL  $1"; fail=1; }
 # 1. Three heavy runs in parallel never overlap with one slot.
 log=$TEST_GATE_HOME/order.log
 for i in 1 2 3; do
-  bin/tg-run -- sh -c "echo start$i >>$log; sleep 1; echo end$i >>$log" 2>>"$TEST_GATE_HOME/err$i" &
+  bin/tg-run -- sh -c "echo start$i >>'$log'; sleep 1; echo end$i >>'$log'" 2>>"$TEST_GATE_HOME/err$i" &
   sleep 0.1
 done
 wait
@@ -22,7 +25,7 @@ grep -q 'QUEUED: position' "$TEST_GATE_HOME/err3" && ok "waiting run reports its
 
 # 2. Two slots allow two at once.
 : >"$log"
-for i in 1 2; do TEST_GATE_SLOTS=2 bin/tg-run -- sh -c "echo start$i >>$log; sleep 1; echo end$i >>$log" 2>/dev/null & done
+for i in 1 2; do TEST_GATE_SLOTS=2 bin/tg-run -- sh -c "echo start$i >>'$log'; sleep 1; echo end$i >>'$log'" 2>/dev/null & done
 wait
 case "$(head -n 2 "$log" | tr '\n' ' ')" in "start"?" start"?" ") ok "TEST_GATE_SLOTS=2 runs two at once" ;; *) bad "slots=2: $(tr '\n' ' ' <"$log")" ;; esac
 
@@ -31,7 +34,7 @@ bin/tg-run -- sh -c 'exit 7' 2>/dev/null
 [ $? = 7 ] && ok "exit code passed through" || bad "exit code"
 
 # 4. Leftover background processes are killed after the command ends.
-bin/tg-run -- sh -c 'sleep 300 & echo $! > '"$TEST_GATE_HOME/bg.pid" 2>/dev/null
+bin/tg-run -- sh -c 'sleep 300 & echo $! > "$1"' sh "$TEST_GATE_HOME/bg.pid" 2>/dev/null
 sleep 0.5
 if kill -0 "$(cat "$TEST_GATE_HOME/bg.pid")" 2>/dev/null; then bad "leftover still alive"; kill "$(cat "$TEST_GATE_HOME/bg.pid")"; else ok "leftover processes cleaned up"; fi
 
@@ -75,6 +78,25 @@ TEST_GATE_FAKE_PRESSURE=4 hook 'yarn test src/a.test.ts'; [ $? = 2 ] && grep -q 
 hook 'yarn test --watch'; [ $? = 2 ] && ok "hook blocks watch" || bad "hook watch"
 hook 'ls'; [ $? = 0 ] && ok "hook ignores unrelated" || bad "hook ls"
 TEST_GATE_HOOK=off hook 'yarn test'; [ $? = 0 ] && ok "TEST_GATE_HOOK=off disables" || bad "hook off"
+
+# 9b. kill -9 on tg-run: the next run cleans up the orphaned command first.
+bin/tg-run -- sh -c 'sleep 301' 2>/dev/null &
+runner=$!
+sleep 0.5
+kill -KILL $runner; wait $runner 2>/dev/null
+pgrep -f 'sleep 301' >/dev/null && ok "orphan alive right after kill -9 (expected)" || bad "orphan setup"
+timeout 10 bin/tg-run -- true 2>/dev/null && ok "next run starts after kill -9" || bad "queue stuck after kill -9"
+pgrep -f 'sleep 301' >/dev/null && { bad "orphaned command not cleaned up"; pkill -f 'sleep 301'; } || ok "orphaned command killed before next run"
+
+# 9c. Slot owned by a live process with a different start time (reused pid) is stale.
+printf 'pid=%s\npstart=Mon Jan  1 00:00:00 2001\nclass=heavy\nsince=0\ncwd=/\ncmd=old\n' $$ >"$TEST_GATE_HOME/slots/1"
+timeout 5 bin/tg-run -- true 2>/dev/null && ok "reused pid does not hold the slot" || bad "reused pid blocks the queue"
+
+# 9d. Run timeout and stdin.
+TEST_GATE_MAX_RUN=1 bin/tg-run -- sleep 30 2>"$TEST_GATE_HOME/t.err"
+grep -q TIMEOUT "$TEST_GATE_HOME/t.err" && ok "TEST_GATE_MAX_RUN stops long runs" || bad "max run"
+echo hello | timeout 5 bin/tg-run -- sh -c 'read x; echo "got:$x"' 2>/dev/null | grep -q '^got:$' && ok "command gets empty stdin" || bad "stdin"
+TEST_GATE_HOOK=on hook 'tg-run --light -- yarn test'; [ $? = 2 ] && ok "hook blocks --light misuse" || bad "hook misuse"
 
 # 10. Logger snapshot, mark, summary, measure.
 bin/tg-log mark "test freeze" >/dev/null && ok "tg-log mark" || bad "mark"

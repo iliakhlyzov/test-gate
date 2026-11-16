@@ -54,6 +54,7 @@ sampler() {
 }
 
 swap0=$(tg_swap_used_mb)
+swap0=${swap0:-0}
 interrupted=0
 start=$(tg_now)
 echo "[test-gate] measuring: $cmd_text" >&2

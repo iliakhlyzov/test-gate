@@ -106,7 +106,8 @@ tg_block_reason() {
     return
   fi
   d=$(tg_disk_free_gb)
-  if [ "${d:-0}" -lt "$min" ]; then
+  # Unknown free space (df failed) never blocks.
+  if [ -n "$d" ] && [ "$d" -lt "$min" ]; then
     echo "only ${d} GB free on the swap disk (need ${min} GB, TEST_GATE_MIN_DISK_GB)"
   fi
 }
@@ -171,30 +172,58 @@ tg_kill_group() {
 # Each queue ticket / slot / light registration is a small key=value file.
 tg_field() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1; }
 
+# Start time of a process; together with the pid it identifies the process
+# even after the pid is reused.
+tg_pstart() { ps -o lstart= -p "$1" 2>/dev/null | tr -s ' '; }
+
+# $1 pid, $2 start time recorded earlier (optional)
+tg_alive() {
+  [ -n "$1" ] && kill -0 "$1" 2>/dev/null || return 1
+  [ -z "${2:-}" ] || [ "$(tg_pstart "$1")" = "$2" ]
+}
+
+# mkdir-based mutex. The owner's pid is stored inside; an abandoned mutex is
+# broken only when its owner is dead, by renaming it (only one breaker wins).
 TG_MUTEX_HELD=0
 tg_mutex_lock() {
-  local i=0
+  local i=0 owner
+  [ -w "$TG_HOME" ] || { echo "test-gate: $TG_HOME is not writable" >&2; exit 70; }
   while ! mkdir "$TG_HOME/mutex" 2>/dev/null; do
     i=$((i + 1))
-    # Critical sections take milliseconds; a mutex older than ~10s is abandoned.
-    if [ $i -ge 100 ]; then rmdir "$TG_HOME/mutex" 2>/dev/null; i=0; fi
+    if [ $((i % 20)) = 0 ]; then
+      owner=$(cat "$TG_HOME/mutex/pid" 2>/dev/null)
+      # No pid after ~10s means the owner died between mkdir and writing it.
+      if { [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; } || { [ -z "$owner" ] && [ $i -ge 100 ]; }; then
+        mv "$TG_HOME/mutex" "$TG_HOME/mutex.dead.$$" 2>/dev/null && rm -rf "$TG_HOME/mutex.dead.$$"
+        i=0
+      fi
+    fi
     sleep 0.1
   done
+  echo $$ >"$TG_HOME/mutex/pid"
   TG_MUTEX_HELD=1
 }
 tg_mutex_unlock() {
-  [ "$TG_MUTEX_HELD" = 1 ] && rmdir "$TG_HOME/mutex" 2>/dev/null
+  if [ "$TG_MUTEX_HELD" = 1 ] && [ "$(cat "$TG_HOME/mutex/pid" 2>/dev/null)" = $$ ]; then
+    rm -rf "$TG_HOME/mutex"
+  fi
   TG_MUTEX_HELD=0
 }
 
-# Drop entries whose owner process is gone (crashed agent, closed session...).
+# Drop entries whose owner is gone (crashed agent, closed session, kill -9).
+# If the owner died but its command's process group still runs, kill the
+# group first: otherwise the next heavy run would start on top of it.
 tg_cleanup_stale() {
-  local d f p
+  local d f p g
   for d in queue slots light; do
     for f in "$TG_HOME/$d"/*; do
       [ -f "$f" ] || continue
       p=$(tg_field "$f" pid)
-      if [ -z "$p" ] || ! kill -0 "$p" 2>/dev/null; then rm -f "$f"; fi
+      [ -n "$p" ] || continue # being written right now
+      tg_alive "$p" "$(tg_field "$f" pstart)" && continue
+      g=$(tg_field "$f" pgid)
+      [ -n "$g" ] && tg_kill_group "$g"
+      rm -f "$f"
     done
   done
 }

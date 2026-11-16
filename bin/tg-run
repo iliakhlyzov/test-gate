@@ -32,7 +32,11 @@ Environment:
   TEST_GATE_MIN_DISK_GB=15    start only with this much free space for swap
   TEST_GATE_MAX_WAIT=0        give up after N seconds of waiting (0 = never), exit 75
   TEST_GATE_REPORT_EVERY=30   seconds between "still waiting" messages
+  TEST_GATE_MAX_RUN=7200      stop the command after N seconds of running (0 = never)
   TEST_GATE_KILL_LEFTOVERS=1  kill processes left in the group after the command ends
+  TEST_GATE_POLL=2            seconds between queue checks
+
+The command gets no input (stdin is /dev/null).
 EOF
   exit 64
 }
@@ -54,6 +58,7 @@ MAX_PRESSURE=${TEST_GATE_MAX_PRESSURE:-2}
 MAX_WAIT=${TEST_GATE_MAX_WAIT:-0}
 REPORT_EVERY=${TEST_GATE_REPORT_EVERY:-30}
 KILL_LEFTOVERS=${TEST_GATE_KILL_LEFTOVERS:-1}
+MAX_RUN=${TEST_GATE_MAX_RUN:-7200}
 POLL=${TEST_GATE_POLL:-2}
 
 say() { printf '[test-gate] %s\n' "$*" >&2; }
@@ -62,15 +67,20 @@ cmd_text=$(printf '%s ' "$@" | tr '\n' ' ')
 cmd_text=${cmd_text% }
 my_file=""
 child=""
+watchdog=""
 wait_start=$(tg_now)
+my_pstart=$(tg_pstart $$)
 
+# Written to a temp file and renamed, so readers never see a half-written file.
 write_info() {
-  printf 'pid=%s\nclass=%s\nsince=%s\ncwd=%s\ncmd=%s\n' \
-    "$$" "$class" "$(tg_now)" "$PWD" "$cmd_text" >"$1"
+  printf 'pid=%s\npstart=%s\nclass=%s\nsince=%s\ncwd=%s\ncmd=%s\n' \
+    "$$" "$my_pstart" "$class" "$(tg_now)" "$PWD" "$cmd_text" >"$1.tmp.$$"
+  mv "$1.tmp.$$" "$1"
 }
 
 cleanup() {
   tg_mutex_unlock
+  [ -n "$watchdog" ] && kill "$watchdog" 2>/dev/null
   [ -n "$child" ] && tg_kill_group "$child"
   [ -n "$my_file" ] && rm -f "$my_file"
   child=""
@@ -163,12 +173,36 @@ fi
 
 # ------------------------------------------------------------------------- run
 run_start=$(tg_now)
-set -m # job control: the command gets its own process group (pgid = $child)
-env "$@" &
+# Job control gives the command its own process group (pgid = $child).
+# stdin is /dev/null: a background group that reads from the terminal would
+# be stopped (SIGTTIN) and hold the slot forever.
+set -m
+env "$@" </dev/null &
 child=$!
 set +m
+# Record the group so a later tg-run can clean it up if we are killed with -9.
+echo "pgid=$child" >>"$my_file"
+
+if [ "$MAX_RUN" -gt 0 ]; then
+  (
+    # Sleep in short steps and stop if tg-run itself is gone (kill -9),
+    # so the watchdog never outlives tg-run and hits an unrelated group.
+    parent=$$
+    end=$(($(tg_now) + MAX_RUN))
+    while [ "$(tg_now)" -lt $end ]; do
+      sleep 2
+      kill -0 "$parent" 2>/dev/null || exit 0
+    done
+    printf '[test-gate] TIMEOUT: the command ran longer than %s (TEST_GATE_MAX_RUN), stopping it\n' "$(tg_fmt_dur "$MAX_RUN")" >&2
+    tg_kill_group "$child"
+  ) &
+  watchdog=$!
+fi
+
 wait "$child"
 rc=$?
+[ -n "$watchdog" ] && kill "$watchdog" 2>/dev/null
+watchdog=""
 
 left=$(tg_group_count "$child")
 if [ "$left" -gt 0 ]; then

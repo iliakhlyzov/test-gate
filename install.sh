@@ -25,13 +25,26 @@ for a in "$@"; do
   esac
 done
 
+# Apply a jq filter to settings.json. Writes through the file (keeps a
+# symlinked settings.json working) and leaves it untouched if jq fails.
+edit_settings() {
+  local tmp="$SETTINGS.tmp.$$"
+  if jq "$@" "$SETTINGS" >"$tmp"; then
+    cp "$SETTINGS" "$SETTINGS.bak"
+    cat "$tmp" >"$SETTINGS"
+    rm -f "$tmp"
+  else
+    rm -f "$tmp"
+    echo "! could not update $SETTINGS (jq failed); it was not changed" >&2
+    return 1
+  fi
+}
+
 remove_hook() {
   [ -f "$SETTINGS" ] && command -v jq >/dev/null 2>&1 || return 0
   grep -q tg-claude-hook "$SETTINGS" || return 0
-  cp "$SETTINGS" "$SETTINGS.bak.$(date +%s)"
-  jq '.hooks.PreToolUse |= ((. // []) | map(.hooks |= map(select(.command | test("tg-claude-hook") | not))) | map(select(.hooks | length > 0)))' \
-    "$SETTINGS" >"$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
-  echo "removed the hook from $SETTINGS"
+  edit_settings '.hooks.PreToolUse |= ((. // []) | map(.hooks |= ((. // []) | map(select((.command // "") | test("tg-claude-hook") | not)))) | map(select(.hooks | length > 0)))' \
+    && echo "removed the hook from $SETTINGS (old version: $SETTINGS.bak)"
 }
 
 if [ $uninstall = 1 ]; then
@@ -62,7 +75,7 @@ snippet=$(cat <<EOF
 {
   "hooks": {
     "PreToolUse": [
-      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "$HOOK" } ] }
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "'$HOOK'" } ] }
     ]
   }
 }
@@ -79,10 +92,11 @@ if [ $want_hook = 1 ]; then
   else
     mkdir -p "$(dirname "$SETTINGS")"
     [ -f "$SETTINGS" ] || echo '{}' >"$SETTINGS"
-    cp "$SETTINGS" "$SETTINGS.bak.$(date +%s)"
-    jq --arg cmd "$HOOK" '.hooks.PreToolUse = ((.hooks.PreToolUse // []) + [{"matcher": "Bash", "hooks": [{"type": "command", "command": $cmd}]}])' \
-      "$SETTINGS" >"$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
-    echo "added the hook to $SETTINGS (backup next to it). Restart Claude Code sessions to pick it up."
+    if edit_settings --arg cmd "'$HOOK'" '.hooks.PreToolUse = ((.hooks.PreToolUse // []) + [{"matcher": "Bash", "hooks": [{"type": "command", "command": $cmd}]}])'; then
+      echo "added the hook to $SETTINGS (old version: $SETTINGS.bak). Restart Claude Code sessions to use it."
+    else
+      exit 1
+    fi
   fi
 else
   echo

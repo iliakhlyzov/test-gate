@@ -31,7 +31,8 @@ samples_file() { echo "$TG_LOGS/samples-$(date +%Y-%m-%d).csv"; }
 logger_pid() {
   local p
   p=$(cat "$PIDFILE" 2>/dev/null) || return 1
-  kill -0 "$p" 2>/dev/null && echo "$p"
+  # The pid file can outlive a reboot; make sure the pid is still our logger.
+  kill -0 "$p" 2>/dev/null && ps -o command= -p "$p" 2>/dev/null | grep -q tg-log && echo "$p"
 }
 
 cmd=${1:-status}
@@ -76,11 +77,14 @@ case "$cmd" in
 
   summary)
     days=${1:-0}
-    files=$(ls "$TG_LOGS"/samples-*.csv 2>/dev/null | sort)
-    [ "$days" -gt 0 ] && files=$(printf '%s\n' "$files" | tail -n "$days")
-    if [ -z "$files" ]; then echo "no samples yet: start the logger with 'tg-log start'"; exit 0; fi
+    # An array, not a string: the default log path contains a space.
+    files=()
+    for f in "$TG_LOGS"/samples-*.csv; do [ -f "$f" ] && files+=("$f"); done
+    if [ ${#files[@]} -eq 0 ]; then echo "no samples yet: start the logger with 'tg-log start'"; exit 0; fi
+    if [ "$days" -gt 0 ] && [ ${#files[@]} -gt "$days" ]; then
+      files=("${files[@]:$((${#files[@]} - days))}")
+    fi
     echo "RAM: $(tg_fmt_gb "$(tg_ram_mb)")"
-    # shellcheck disable=SC2086
     awk -F, '
       FNR == 1 { next }
       { n++; pc[$2]++; if (first == "") first = $1; last = $1
@@ -105,7 +109,7 @@ case "$cmd" in
         printf "peak browsers total: %d MB, peak VM (Docker etc.): %d MB\n", br, vm
         printf "max concurrent jest runs: %d, playwright runs: %d, queued in test-gate: %d\n", jest, pw, q
         if (bad) { print "first moments with elevated pressure:"; for (i = 1; i <= bad; i++) print bad_lines[i] }
-      }' $files
+      }' "${files[@]}"
     if [ -f "$TG_LOGS/events.csv" ]; then
       echo "marked events:"
       awk -F, 'NR > 1 { printf "  %s  %s  (pressure %s, swap %s MB, top: %s %s MB)\n", $1, $2, $3, $5, $17, $18 }' "$TG_LOGS/events.csv"

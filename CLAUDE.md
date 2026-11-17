@@ -8,5 +8,6 @@
   a Linux container.
 - Everything in the repo is in simple English (B1 level): code, messages,
   docs, commit messages.
-- Run `tests/classify.test.sh` and `tests/queue.test.sh` after changes, and
+- Run `tests/classify.test.sh`, `tests/queue.test.sh` and
+  `tests/node.test.sh` after changes, and
   `shellcheck -x -S warning bin/* lib/*.sh install.sh swiftbar/*.sh tests/*.sh`.

@@ -59,6 +59,12 @@ interrupted=0
 start=$(tg_now)
 echo "[test-gate] measuring: $cmd_text" >&2
 
+# Measure the run itself, without waiting in the queue (see node/gate.js).
+export TEST_GATE_INSIDE=1
+if [ -n "${NODE_OPTIONS:-}" ]; then
+  NODE_OPTIONS=$(tg_strip_gate "$NODE_OPTIONS")
+  export NODE_OPTIONS
+fi
 set -m
 env "$@" &
 child=$!

@@ -63,6 +63,19 @@ POLL=${TEST_GATE_POLL:-2}
 
 say() { printf '[test-gate] %s\n' "$*" >&2; }
 
+# node/gate.js sets TEST_GATE_PARENT to the pid of the Node process that
+# waits for us. If that process is killed, nobody needs this run any more.
+GATE_PARENT=${TEST_GATE_PARENT:-}
+unset TEST_GATE_PARENT
+parent_gone() { [ -n "$GATE_PARENT" ] && ! kill -0 "$GATE_PARENT" 2>/dev/null; }
+leave_if_parent_gone() {
+  if parent_gone; then
+    say "the program that started this run is gone (pid $GATE_PARENT); leaving the queue"
+    cleanup
+    exit 143
+  fi
+}
+
 cmd_text=$(printf '%s ' "$@" | tr '\n' ' ')
 cmd_text=${cmd_text% }
 my_file=""
@@ -158,6 +171,7 @@ if [ "$class" = heavy ]; then
       report "QUEUED: position $pos of $qlen. Running now: $(running_brief)."
     fi
     sleep "$POLL"
+    leave_if_parent_gone
   done
   say "RUNNING (slot $slot of $SLOTS, waited $(tg_fmt_dur $(($(tg_now) - wait_start)))): $cmd_text"
 else
@@ -168,6 +182,7 @@ else
     [ -z "$block" ] && break
     report "WAITING (light run): $block."
     sleep "$POLL"
+    leave_if_parent_gone
   done
 fi
 
@@ -176,6 +191,14 @@ run_start=$(tg_now)
 # Job control gives the command its own process group (pgid = $child).
 # stdin is /dev/null: a background group that reads from the terminal would
 # be stopped (SIGTTIN) and hold the slot forever.
+# TEST_GATE_INSIDE tells node/gate.js that this run already has its place.
+# Also remove the gate from NODE_OPTIONS: some tools (turbo) do not pass
+# all env vars to their tasks, and a gated task would wait for us forever.
+export TEST_GATE_INSIDE=1
+if [ -n "${NODE_OPTIONS:-}" ]; then
+  NODE_OPTIONS=$(tg_strip_gate "$NODE_OPTIONS")
+  export NODE_OPTIONS
+fi
 set -m
 env "$@" </dev/null &
 child=$!
@@ -183,15 +206,19 @@ set +m
 # Record the group so a later tg-run can clean it up if we are killed with -9.
 echo "pgid=$child" >>"$my_file"
 
-if [ "$MAX_RUN" -gt 0 ]; then
+if [ "$MAX_RUN" -gt 0 ] || [ -n "$GATE_PARENT" ]; then
   (
     # Sleep in short steps and stop if tg-run itself is gone (kill -9),
     # so the watchdog never outlives tg-run and hits an unrelated group.
     parent=$$
     end=$(($(tg_now) + MAX_RUN))
-    while [ "$(tg_now)" -lt $end ]; do
+    while [ "$MAX_RUN" -le 0 ] || [ "$(tg_now)" -lt $end ]; do
       sleep 2
       kill -0 "$parent" 2>/dev/null || exit 0
+      if parent_gone; then
+        kill -TERM "$parent" # tg-run stops the command and frees the slot
+        exit 0
+      fi
     done
     printf '[test-gate] TIMEOUT: the command ran longer than %s (TEST_GATE_MAX_RUN), stopping it\n' "$(tg_fmt_dur "$MAX_RUN")" >&2
     tg_kill_group "$child"

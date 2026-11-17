@@ -167,6 +167,26 @@ tg_kill_group() {
   return 0
 }
 
+# Prints NODE_OPTIONS without "--require .../test-gate/node/gate.js".
+tg_strip_gate() {
+  local out="" w skip=0
+  set -f
+  # shellcheck disable=SC2086
+  for w in $1; do
+    if [ $skip = 1 ]; then
+      skip=0
+      case "$w" in *test-gate*/node/gate.js) continue ;; *) out="$out --require $w"; continue ;; esac
+    fi
+    case "$w" in
+      --require | -r) skip=1 ;;
+      --require=*test-gate*/node/gate.js | -r=*test-gate*/node/gate.js) ;;
+      *) out="$out $w" ;;
+    esac
+  done
+  set +f
+  printf '%s\n' "${out# }"
+}
+
 # --------------------------------------------------------------- queue state
 
 # Each queue ticket / slot / light registration is a small key=value file.

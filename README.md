@@ -107,6 +107,49 @@ It shows peak swap and memory, the lowest free disk space, moments with high
 memory pressure and the top processes at that time, your marks, and how long
 runs waited in the queue.
 
+## Node gate: works with any agent (prototype)
+
+The Claude Code hook sees only Claude Code. The Node gate works for every
+agent (Claude, Codex, Cursor...), your IDE and you, and changes nothing in
+your repositories. Add this line to `~/.zshenv` and open a new terminal:
+
+```bash
+[ -f "$HOME/.test-gate/node/gate.js" ] && export NODE_OPTIONS="--require $HOME/.test-gate/node/gate.js ${NODE_OPTIONS:-}"
+```
+
+It keeps your other `NODE_OPTIONS`. It needs a home folder path without
+spaces. The `[ -f ... ]` check matters: if
+`NODE_OPTIONS` points to a file that does not exist, **every** `node`,
+`npm` and `yarn` command fails. To remove the gate, delete this line.
+
+Now every Node process loads `node/gate.js` first (it costs about 2 ms):
+
+- not Jest, Vitest or Playwright: nothing happens;
+- a run with explicit test files (`jest src/a.test.ts`): runs at once,
+  without the queue. A script name or option with `it`, `e2e` or
+  `integration` (like `test:it`) still uses the queue;
+- `playwright test`, or a run without test files: the gate starts the same
+  command again through `tg-run --` and waits in the queue.
+
+To check that an agent gets it, ask it to run `echo $NODE_OPTIONS`.
+To turn it off for one command: `TEST_GATE_NODE=off yarn test`.
+
+The gate does nothing for watch mode (`--watch`, `vitest` in a terminal,
+`--ui`) and when a debugger is attached (`--inspect`, VS Code).
+If the waiting Node process is killed, its run leaves the queue, or stops
+if it already runs.
+
+Limits:
+
+- If a script starts Docker first and Jest later
+  (`docker compose up && jest`), Docker starts before the queue. Run such
+  scripts with `tg-run -- yarn test:it`.
+- Node's own test runner (`node --test`) is not gated.
+- In a monorepo, `yarn workspaces foreach -p run test` puts each Jest in
+  the queue on its own, so they run one by one.
+- If something fails inside the gate, or `tg-run` is not found, the tests
+  run as usual.
+
 ## Commands
 
 | Command | What it does |
@@ -219,7 +262,7 @@ and two are waiting. The menu lists the runs, with a Stop button for each.
 ## Development
 
 ```bash
-tests/classify.test.sh && tests/queue.test.sh
+tests/classify.test.sh && tests/queue.test.sh && tests/node.test.sh
 ```
 
 See [CLAUDE.md](CLAUDE.md) for the rules (bash 3.2, BSD tools).
